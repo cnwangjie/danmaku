@@ -11,6 +11,7 @@ just require the danmaku.js
 
  - [ ] improve the performance
  - [x] basically realize the uniform insert like niconico
+ - [x] fix bug about flash when disappear
  - [ ] input box style and the color select box
  - [ ] danmaku engine back-end
  - [ ] socket to the back-end

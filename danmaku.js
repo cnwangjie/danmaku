@@ -1,13 +1,16 @@
+var danmaku = function(){
 // Here are based on canvas
 var $w = $(window)
 // create canvas
-$('body').append('<canvas id="danmaku-canvas" width="'+$w.width()+'" height="'+$w.height()+'" style="z-index:-1;position:absolute;left:0px;top:0px;bottom:0px;right:0px">')
+$('body').append('<canvas id="danmaku-canvas" width="'+$w.width()+'" height="'+$w.height()+'" style="z-index:-1;position:fixed;left:0px;top:0%;bottom:0%;right:0px">')
 var $c = $('#danmaku-canvas')
 var ca = {
+  start: Date.now(),
+  circle: 10000,
   x: $w.width(),
   y: $w.height(),
-  dm: [
-  ]
+  dm: [],
+  pool: []
 }
 
 // create ctx
@@ -19,8 +22,10 @@ ctx.shadowsOffsetX = 10
 ctx.shadowsOffsetY = 10
 ctx.shadowBlur = 10
 
+// it is a plugin
 // background stars
 var star = {
+  sum: ca.x * ca.y / 6E3 >> 0,
   switcher: true,
   data: [],
   new: true,
@@ -90,7 +95,9 @@ var star = {
 
 // add a new danmaku
 ca.add = (data) => {
+  // 弹幕飞行的速度
   data.v = Math.floor(data.msg.length / 3) + 5
+
   data.x = ca.x
 
   // 把弹幕往空的地方放，如果没有空位就出现在新的一行
@@ -112,18 +119,22 @@ ca.add = (data) => {
 }
 
 // draw on the canvas
-var draw = () => {
+ca.draw = () => {
   if (star.switcher) {
-      star.star(75)
+      star.star(star.sum)
   }
 
   ctx.font = '24px Arial'
+  var del = []
   for (var i = 0; i < ca.dm.length; i++) {
+    del[i] = []
     for (var j = 0; j < ca.dm[i].length; j++) {
       // console.log('drawing')
       ca.dm[i][j].x -= ca.dm[i][j].v
       if (ca.dm[i][j].x < -100) {
-        ca.dm[i].splice(j, 1)
+        // 将超出屏幕的弹幕删除
+        // 靠后的先删除
+        del[i].unshift(j)
 
       } else {
         ctx.fillStyle = ca.dm[i][j].color
@@ -132,23 +143,29 @@ var draw = () => {
 
     }
   }
+  for (let i = 0; i < del.length; i++) {
+    for (let j = 0; j < del[i].length; j++) {
+      ca.dm[i].splice(del[i][j], 1)
+    }
+  }
 }
 
-var move = () => {
+ca.shoot = () => {
   setInterval(() => {
     // console.log('looping')
     ctx.clearRect(0, 0, ca.x, ca.y)
-    draw()
-  }, 50)
+    ca.draw()
+  }, 50) // f: 20hz
 }
 
 // init danmaku
-var init = () => {
+ca.init = () => {
   $('body').append('<div class="danmaku-footer" z-index="1">\
     <input id="danmaku-sender" placeholder="发射弹幕！"></input>\
-    <input id="danmaku-color" type="color" value="#ffffff"></input>\
+    <input id="danmaku-color" value="#ffffff"></input>\
   </div>')
-  $('.danmaku-footer').attr('style', 'background-color:rgba(1, 1, 1 , 0.65);position:absolute;left:0px;right:0px;bottom:0px;padding-bottom:7px;padding-top:7px;width:100%;text-align:center')
+  $('.danmaku-footer').attr('style', 'background-color:rgba(1, 1, 1 , 0.65);position:fixed;left:0px;right:0px;bottom:0%;padding-bottom:7px;padding-top:7px;width:100%;text-align:center;z-index:2')
+  $('#danmaku-color').cxColor()
   $('#danmaku-sender').attr('style', 'width:70%')
   $('#danmaku-sender').keydown(() => {
     if (event.which == 13) {
@@ -157,24 +174,69 @@ var init = () => {
       var data = {
         msg: val,
         color: color,
-        time: Date.now()
+        time: Date.now() - ca.start
       }
+      // 发射弹幕
       ca.add(data)
+      // 加入本地弹幕池
+      ca.pool.push(data)
       $('#danmaku-sender').val('')
     }
   })
   // console.log('init')
 
-  // 性能测试
+  // local性能测试
   // var i = 0
   // setInterval(() => {
   //   ca.add({msg: 'test'+i, color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)})
   //   i++
   // }, 10)
-  move()
+
+  // circle性能测试
+  for (let i = 0; i < 100; i ++) {
+    ca.pool.push({msg: '花式求star'+i, color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16), time: Math.random() * 1e5 >> 0})
+  }
+  for (let i = 0; i < 100; i ++) {
+    ca.pool.push({msg: '跪求star啊啊！！', color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16), time: Math.random() * 1e5 >> 0})
+  }
+  for (let i = 0; i < 100; i ++) {
+    ca.pool.push({msg: '好哥哥给我个star吧', color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16), time: Math.random() * 1e5 >> 0})
+  }
+  for (let i = 0; i < 20; i ++) {
+    ca.pool.push({msg: '求你了给我个star吧求你了给我个star吧求你了给我个star吧', color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16), time: Math.random() * 1e5 >> 0})
+  }
+  console.log(ca.pool)
+
+  // shoot !!!
+  ca.shoot()
+
+  // test
+  ca.circler()
+  setInterval(() => {
+    if (Date.now() > ca.start + ca.circle) {
+      ca.circler()
+    }
+  }, 10)
 }
 
-init()
+
+// 在socket获取到弹幕数据后执行circler()用于周期性循环发射弹幕
+ca.circler = () => {
+    for (var i = 0; i < ca.pool.length; i += 1) {
+        if ('time' in ca.pool[i]) {
+
+            ((data, time) => {
+                setTimeout(() => {ca.add(data)}, time)
+            })(ca.pool[i], ca.pool[i].time)
+        }
+    }
+    ca.start = Date.now()
+    ca.circle = ca.pool.length * 100 + 10E3// 每100条弹幕可以为弹幕周期+1s
+
+}
+
+
+ca.init()
 
 // 跟随鼠标绘制随即图案
 // c.mousemove((e) => {
@@ -194,14 +256,20 @@ var starBackground = () => {
 }
 // starBackground()
 
+// API
+this.ca = ca
+this.star = star
+this.ctx = ctx
+}
+
+var danmaku = new danmaku();
 
 
 
 
 
 
-
-
+// saved for future
 () => {
 // following are baed on DOM
 var data = [

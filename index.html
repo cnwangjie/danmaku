@@ -7,10 +7,47 @@
     body {
       background-color: #333;
     }
+    .container {
+      z-index: 2;
+      margin-top: 10%;
+      text-align: center;
+      color: white;
+      text-shadow: 5px 5px 3px rgba(0,0,0,.5)
+    }
+    .link p {
+      font-size: 48px;
+      margin-top: 18px;
+      margin-bottom: 18px;
+    }
+    h1 {
+      font-size: 78px;
+    }
+    a {
+      color: white;
+      z-index: 2;
+      text-decoration: none;
+    }
+    .btn {
+      margin: auto;
+    }
   </style>
+  <link rel="stylesheet" href="./dist/jquery.cxcolor.css">
 </head>
 <body>
+  <div class="container">
+    <h1>danmaku</h1>
+    <div class="link">
+      <a href="https://github.com/cnwangjie/danmaku"><p>仓库地址<p></a>
+      <a href="https://www.cnwangjie.com"><p>联系作者</p></a>
+    </div>
+    <div class="btn">
+      <a href="#" onclick="javascript:danmaku.ca.dm=[]"><span>清空所有弹幕</span></a>
+      <a href="#" onclick="javascript:danmaku.star.switcher = danmaku.star.switcher?false:true;"><span>开关背景的星星</span></a>
+    </div>
+  </div>
   <script src="./dist/jquery.min.js"></script>
+  <script src="./dist/jquery.cxcolor.min.js"></script>
+  <script src="./dist/socket.io.min.js"></script>
   <script src="./danmaku.js"></script>
 </body>
 </html>
