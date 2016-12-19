@@ -4,6 +4,7 @@ var $w = $(window)
 // create canvas
 $('body').append('<canvas id="danmaku-canvas" width="'+$w.width()+'" height="'+$w.height()+'" style="z-index:-1;position:fixed;left:0px;top:0%;bottom:0%;right:0px">')
 var $c = $('#danmaku-canvas')
+
 var ca = {
   start: Date.now(),
   circle: 10000,
@@ -13,6 +14,63 @@ var ca = {
   pool: []
 }
 
+if (typeof(io) != 'undefined') {
+// 创建与弹幕服务器的socket连接
+var socket = io.connect('http://localhost:3000')
+
+// 检测与弹幕服务器的连接情况
+var timeout = setTimeout(() => {
+    if (socket.disconnect && this.socket.io.reconnecting) {
+        $('#danmaku-sender').remove()
+        $('#danmaku-color').remove()
+        $('.danmaku-footer').append('<p style="color:red">连接弹幕服务器超时</p>')
+        delete socket
+    }
+}, 10000)
+
+socket.on('connect', () => {
+  let auth = {
+    method: 'auth',
+    domain: window.location.hostname,
+    path: window.location.pathname
+  }
+  clearTimeout(timeout)
+  socket.send(auth)
+})
+
+socket.on('system', (json) => {
+  if (json.status == 'danger') {
+    console.log(json)
+    switch (json.code) {
+      case 3:
+        $('#danmaku-sender').remove()
+        $('#danmaku-color').remove()
+        $('.danmaku-footer').append('<p style="color:red">该域名尚未注册本服务</p>')
+        delete socket
+        break
+      default:
+        $('#danmaku-footer').append('<p id="danmaku-error-message" style="color:red">'+json.msg+'</p>')
+        setTimeout(()=>{
+            $('#danmaku-error-message').remove()
+        }, 5000)
+    }
+  }
+})
+
+socket.on('add', (json) => {
+  if ('length' in json) {
+    for (let i = 0; i < json.length; i++) {
+        json[i] = JSON.parse(json[i])
+        ca.add(json[i])
+    }
+    ca.pool = json
+  } else {
+    ca.pool.push(json)
+  }
+})
+} else {
+    var socket = null
+}
 // create ctx
 var ctx = document.getElementById('danmaku-canvas').getContext('2d')
 
@@ -131,7 +189,7 @@ ca.draw = () => {
     for (var j = 0; j < ca.dm[i].length; j++) {
       // console.log('drawing')
       ca.dm[i][j].x -= ca.dm[i][j].v
-      if (ca.dm[i][j].x < -100) {
+      if (ca.dm[i][j].x < -300) {
         // 将超出屏幕的弹幕删除
         // 靠后的先删除
         del[i].unshift(j)
@@ -165,16 +223,32 @@ ca.init = () => {
     <input id="danmaku-color" value="#ffffff"></input>\
   </div>')
   $('.danmaku-footer').attr('style', 'background-color:rgba(1, 1, 1 , 0.65);position:fixed;left:0px;right:0px;bottom:0%;padding-bottom:7px;padding-top:7px;width:100%;text-align:center;z-index:2')
-  $('#danmaku-color').cxColor()
+  if ('cxColor' in $('#danmaku-color')) {
+      $('#danmaku-color').cxColor()
+  } else {
+      $('#danmaku-color').attr('type', 'color')
+  }
   $('#danmaku-sender').attr('style', 'width:70%')
   $('#danmaku-sender').keydown(() => {
     if (event.which == 13) {
       var val = $('#danmaku-sender').val()
       var color = $('#danmaku-color').val()
+      if (val == '') {
+          return
+      }
       var data = {
         msg: val,
         color: color,
-        time: Date.now() - ca.start
+        time: Date.now() - ca.start,
+        truetime: Date.now()
+      }
+
+      if (socket.connected) {
+        let json = {
+            data: data,
+            method: 'send'
+        }
+        socket.send(json)
       }
       // 发射弹幕
       ca.add(data)
@@ -205,7 +279,6 @@ ca.init = () => {
   for (let i = 0; i < 20; i ++) {
     ca.pool.push({msg: '求你了给我个star吧求你了给我个star吧求你了给我个star吧', color: '#'+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16)+Math.floor(16 * Math.random()).toString(16), time: Math.random() * 1e5 >> 0})
   }
-  console.log(ca.pool)
 
   // shoot !!!
   ca.shoot()
@@ -260,6 +333,7 @@ var starBackground = () => {
 this.ca = ca
 this.star = star
 this.ctx = ctx
+this.socket = socket
 }
 
 var danmaku = new danmaku();

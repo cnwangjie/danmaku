@@ -1,0 +1,10 @@
+{
+  "main": "server.js",
+  "author": "cnwangjie",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "async": "^2.1.4",
+    "redis": "^2.6.3",
+    "socketio": "^1.0.0"
+  }
+}
