@@ -71,8 +71,10 @@ socket.on('add', (json) => {
 } else {
     var socket = null
 }
+
+var cvs = document.getElementById('danmaku-canvas')
 // create ctx
-var ctx = document.getElementById('danmaku-canvas').getContext('2d')
+var ctx = cvs.getContext('2d')
 
 // default setting
 ctx.shadowColor = "gray"
@@ -122,11 +124,11 @@ var star = {
     var died = []
     for (var i = 0; i < n; i++) {
       if (star.data[i].dying) {
-        star.data[i].size -= 1;
-        star.data[i].x++
-        star.data[i].y--
+        star.data[i].size -= 0.5
+        star.data[i].x += 0.5
+        star.data[i].y -= 0.5
       } else {
-        star.data[i].size += 1;
+        star.data[i].size += 0.5;
       }
       ctx.fillStyle = star.data[i].color
       ctx.font = star.data[i].size+'px Arial'
@@ -154,7 +156,7 @@ var star = {
 // add a new danmaku
 ca.add = (data) => {
   // 弹幕飞行的速度
-  data.v = Math.floor(data.msg.length / 3) + 5
+  data.v = Math.floor(data.msg.length / 6) + 2.5
 
   data.x = ca.x
 
@@ -206,14 +208,15 @@ ca.draw = () => {
       ca.dm[i].splice(del[i][j], 1)
     }
   }
+  window.requestAnimationFrame(() => {
+    cvs.width = cvs.width
+    ca.draw()
+  })
+
 }
 
 ca.shoot = () => {
-  setInterval(() => {
-    // console.log('looping')
-    ctx.clearRect(0, 0, ca.x, ca.y)
     ca.draw()
-  }, 50) // f: 20hz
 }
 
 // init danmaku
