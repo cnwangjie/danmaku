@@ -246,7 +246,7 @@ ca.init = () => {
         truetime: Date.now()
       }
 
-      if (socket.connected) {
+      if (socket && socket.connected) {
         let json = {
             data: data,
             method: 'send'
