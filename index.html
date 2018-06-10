@@ -22,16 +22,34 @@
     h1 {
       font-size: 78px;
     }
-    a {
+    span, a {
       color: white;
       z-index: 2;
       text-decoration: none;
+      cursor: pointer;
     }
     .btn {
       margin: auto;
     }
+    .footer {
+      background-color: rgba(1, 1, 1, 0.65);
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding-bottom: 7px;
+      padding-top: 7px;
+      text-align: center;
+      z-index: 2;
+    }
+    input[type="text"] {
+      width: 80%;
+    }
+    input[type="color"] {
+      border: 0;
+      padding: 0;
+    }
   </style>
-  <link rel="stylesheet" href="./dist/jquery.cxcolor.css">
 </head>
 <body>
   <p id="fps"></p>
@@ -42,13 +60,39 @@
       <a href="https://www.cnwangjie.com">联系作者</a>
     </div>
     <div class="btn">
-      <a href="#" onclick="javascript:danmaku.ca.dm=[]"><span>清空所有弹幕</span></a>
-      <a href="#" onclick="javascript:danmaku.star.switcher = danmaku.star.switcher?false:true;"><span>开关背景的星星</span></a>
+      <span id="clear-stage-btn">清空所有弹幕</span>
     </div>
   </div>
-  <script src="./dist/jquery.min.js"></script>
-  <script src="./dist/jquery.cxcolor.min.js"></script>
-  <!-- <script src="./dist/socket.io.min.js"></script> -->
+  <div class="footer">
+    <input id="sender" type="text" placeholder="发射弹幕！"></input>
+    <input id="color" type="color" value="#ffffff"></input>
+  </div>
   <script src="./danmaku.js"></script>
+  <script>
+  var danmaku = new Danmaku({
+    autoplay: true,
+    loop: true,
+    loopInterval: 1e5,
+    autoresize: true,
+  });
+  const msgList = ['花式求star', '跪求star啊啊！！', '好哥哥给我个star吧', '求你了给我个star吧求你了给我个star吧求你了给我个star吧']
+  msgList.map(msg => {
+    Array(100).fill(null).map((_, index) => {
+      danmaku.pool.push({
+        msg: msg + ' x' + index,
+        color: '#' + Array(3).fill(null).map(_ => (Math.random() * 16 << 0).toString(16)).join(''),
+        time: Math.random() * 1e5 << 0,
+      })
+    })
+  })
+  document.getElementById('clear-stage-btn').addEventListener('click', () => danmaku._store.stage = [])
+  const sender = document.getElementById('sender')
+  const color = document.getElementById('color')
+  sender.addEventListener('keydown', e => {
+    if (e.keyCode !== 13) return
+    danmaku.shoot({ msg: sender.value, color: color.value })
+    sender.value = ''
+  })
+  </script>
 </body>
 </html>
