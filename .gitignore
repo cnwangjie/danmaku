@@ -1,3 +1,1478 @@
+/*
+ * Copyright (C) 2020 Ujjwal Kumar <ujjwalkumar0501@gmail.com>
+ *
+ * SPDX-License-Identifier: LGPL-2.1+
+ */
+
+#include "config.h"
+#include <glib/gi18n-lib.h>
+
+#include "hdy-grid.h"
+
+/**
+ * SECTION:hdy-grid
+ * @short_description: An adaptive grid widget.
+ * @Title: HdyGrid
+ *
+ * The #HdyGrid widget repositions children of a row when enough width is
+ * unavailable.
+ *
+ * # CSS nodes
+ *
+ * #HdyGrid has a single CSS node with name grid.
+ *
+ * You can set the column weights too:
+ * |[
+ * <object class="HdyGrid">
+ *  <columns>
+ *    <column>
+ *      <property name="weight">1</property>
+ *      <property name="position">2</property>
+ *    </column>
+ *    <column>
+ *      <property name="weight">0</property>
+ *      <property name="position">3</property>
+ *    </column>
+ *  </columns>
+ * </object>
+ * ]|
+ *
+ * Since: 1.0
+ */
+
+enum {
+  PROP_0,
+  PROP_COLUMN_SPACING,
+  PROP_ROW_SPACING,
+  LAST_PROP
+};
+
+enum {
+  CHILD_PROP_0,
+  CHILD_PROP_ROW,
+  CHILD_PROP_COLUMN,
+  LAST_CHILD_PROP
+};
+
+typedef struct
+{
+  gint  splits;
+  gint *wt_line;
+  gint *line_mcount;
+} HdyGridColumnSplit;
+
+typedef struct
+{
+  gint column;
+  gint weight;
+} HdyGridColumnProperty;
+
+typedef struct {
+  gint position;
+  gint minimum;
+  gint natural;
+  gint allocation;
+  gint weight;
+
+  guint empty:  1;
+  guint expand: 1;
+} HdyGridLine;
+
+typedef struct {
+  HdyGridLine *lines[2];
+  HdyGridColumnSplit split;
+
+  gint min[2];
+  gint max[2];
+  gint weight[2];
+} HdyGridRequest;
+
+typedef struct
+{
+  GList *children;
+  GList *columns_prop;
+
+  gint row_spacing;
+  gint column_spacing;
+} HdyGridPrivate;
+
+typedef struct
+{
+  GtkWidget *widget;
+
+  gint weight;
+  gint attach[2];
+} HdyGridChild;
+
+static void hdy_grid_buildable_init (GtkBuildableIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE (HdyGrid, hdy_grid, GTK_TYPE_CONTAINER,
+                         G_ADD_PRIVATE (HdyGrid)
+                         G_IMPLEMENT_INTERFACE (GTK_TYPE_BUILDABLE,
+                         hdy_grid_buildable_init))
+
+static GParamSpec *props[LAST_PROP];
+static GParamSpec *child_props[LAST_CHILD_PROP];
+static GtkBuildableIface *parent_buildable_iface;
+
+static GList *
+find_child (GList     *list,
+            GtkWidget *widget)
+{
+  HdyGridChild *child;
+
+  for (GList *l = list; l; l = l->next) {
+    child = l->data;
+    if (child->widget == widget)
+      return l;
+  }
+
+  return NULL;
+}
+
+static void
+free_child (HdyGridChild *child)
+{
+  g_slice_free (HdyGridChild, child);
+}
+
+static void
+free_columns_prop (HdyGridColumnProperty *prop)
+{
+  g_slice_free (HdyGridColumnProperty, prop);
+}
+
+static void
+count_lines (HdyGrid        *self,
+             HdyGridRequest *request)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridColumnProperty *prop;
+  HdyGridChild *child;
+  gint columns;
+
+  request->min[0] = request->min[1] = request->weight[0] = G_MAXINT;
+  request->max[0] = request->max[1] = request->weight[1] = G_MININT;
+
+  for (GList *l = priv->children; l; l = l->next) {
+    child = l->data;
+    request->min[0] = MIN (request->min[0], child->attach[0]);
+    request->max[0] = MAX (request->max[0], child->attach[0] + 1);
+    request->min[1] = MIN (request->min[1], child->attach[1]);
+    request->max[1] = MAX (request->max[1], child->attach[1] + 1);
+  }
+
+  columns = request->max[0] - request->min[0];
+
+  for (GList *l = priv->columns_prop; l; l = l->next) {
+    prop = l->data;
+    request->weight[0] = MIN (request->weight[0], prop->weight);
+    request->weight[1] = MAX (request->weight[1], prop->weight + 1);
+    columns--;
+  }
+
+  /* The default weight of columns is 0 */
+  if (columns > 0)
+    request->weight[0] = MIN (request->min[0], 0);
+
+  if (!priv->columns_prop) {
+    request->weight[0] = 0;
+    request->weight[1] = 1;
+  }
+}
+
+static void
+request_init (HdyGrid        *self,
+              HdyGridRequest *request,
+              GtkOrientation  orientation,
+              gint            split_count)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridLine *lines = request->lines[orientation];
+  HdyGridChild *child;
+  gint *wt_line = request->split.wt_line;
+  gint min_line;
+  gint max_line;
+  gint line_idx;
+  gint weight;
+
+  min_line = request->min[orientation];
+  max_line = request->max[orientation];
+
+  for (gint i = 0; i < max_line - min_line; i++) {
+    lines[i].minimum = 0;
+    lines[i].natural = 0;
+    lines[i].allocation = 0;
+    lines[i].position = 0;
+    lines[i].empty = TRUE;
+    lines[i].expand = FALSE;
+    lines[i].weight = 0;
+  }
+
+  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
+    for (GList *l = priv->columns_prop; l; l = l->next) {
+      HdyGridColumnProperty *prop = l->data;
+
+      if (prop->column < min_line || prop->column > max_line)
+        g_error ("Column %d is out of range in the grid", prop->column);
+      lines[prop->column - min_line].weight = prop->weight;
+    }
+  }
+
+  for (GList *l = priv->children; l; l = l->next) {
+    child = l->data;
+    weight = request->lines[0][child->attach[0] - request->min[0]].weight;
+
+    if (split_count > 1)
+      line_idx = (child->attach[orientation] - min_line) * split_count + wt_line[weight];
+    else
+      line_idx = child->attach[orientation] - min_line;
+    lines[line_idx].empty = FALSE;
+
+    if (gtk_widget_compute_expand (child->widget, orientation))
+      lines[line_idx].expand = TRUE;
+  }
+}
+
+static gint
+get_child_allocation (HdyGridRequest *request,
+                      HdyGridChild   *child,
+                      GtkOrientation  orientation)
+{
+  HdyGridLine *lines = request->lines[orientation];
+  gint splits = request->split.splits;
+  gint *wt_line = request->split.wt_line;
+  gint min_line = request->min[orientation];
+  gint weight = request->lines[0][child->attach[0] - request->min[0]].weight;
+  gint line_idx;
+
+  if (orientation == GTK_ORIENTATION_VERTICAL && splits > 1)
+    line_idx = (child->attach[orientation] - min_line) * splits + wt_line[weight];
+  else
+    line_idx = child->attach[orientation] - min_line;
+
+  return lines[line_idx].allocation;
+}
+
+static void
+request_run (HdyGrid        *self,
+             HdyGridRequest *request,
+             GtkOrientation  orientation,
+             gint            for_size,
+             gint            split_count)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridLine *lines = request->lines[orientation], *line;
+  HdyGridChild *child;
+  GList *list = priv->children;
+  gint child_min;
+  gint child_nat;
+  gint min_line;
+  gint line_idx;
+  gint attach;
+  gint size;
+  gint *wt_line = request->split.wt_line;
+
+  min_line = request->min[orientation];
+
+  for (; list; list = list->next) {
+    child = list->data;
+    attach = child->attach[0] - request->min[0];
+    if (orientation == GTK_ORIENTATION_VERTICAL && split_count > 1)
+      line_idx = (child->attach[orientation] - min_line) * split_count +
+            wt_line[request->lines[0][attach].weight];
+    else
+      line_idx = child->attach[orientation] - min_line;
+    line = &lines[line_idx];
+
+    if (for_size < 1) {
+      if (orientation == GTK_ORIENTATION_HORIZONTAL)
+        gtk_widget_get_preferred_width (child->widget, &child_min, &child_nat);
+      else
+        gtk_widget_get_preferred_height (child->widget, &child_min, &child_nat);
+    } else {
+      size = get_child_allocation (request, child, 1 - orientation);
+      if (orientation == GTK_ORIENTATION_HORIZONTAL)
+        gtk_widget_get_preferred_width_for_height (child->widget,
+                                                   size,
+                                                   &child_min,
+                                                   &child_nat);
+      else
+        gtk_widget_get_preferred_height_for_width (child->widget,
+                                                   size,
+                                                   &child_min,
+                                                   &child_nat);
+    }
+
+    line->minimum = MAX (line->minimum, child_min);
+    line->natural = MAX (line->natural, child_nat);
+  }
+}
+
+static void
+column_split_count (HdyGridRequest *request,
+                    GtkOrientation  orientation,
+                    gint            width)
+{
+  HdyGridLine *line, *lines = request->lines[orientation];
+  gint *wt_line;
+  gint *weights;
+  gint j = 0;
+  gint line_count = request->max[orientation] - request->min[orientation];
+
+  wt_line = request->split.wt_line;
+  weights = g_new0 (gint, request->weight[1] - request->weight[0]);
+
+  for (gint i = 0; i < line_count; i++) {
+    line = &lines[i];
+    weights[line->weight - request->weight[0]] += line->minimum;
+  }
+
+  /* We remember which weight-group goes into which line (weight to line map) */
+  for (gint i = 0, group_weight = 0; i < request->weight[1] - request->weight[0]; i++) {
+    if (group_weight + weights[i] > width) {
+      group_weight = weights[i];
+      j++;
+    } else {
+      group_weight += weights[i];
+    }
+
+    wt_line[i] = j;
+  }
+
+  request->split.splits = j + 1;
+  request->split.line_mcount = g_new0 (gint, j + 1);
+
+  /* Count & remember the number of members in each line after splitting columns */
+  for (gint i = 0; i < line_count; i++)
+    request->split.line_mcount[wt_line[lines[i].weight]]++;
+
+  g_free (weights);
+}
+
+static void
+request_distribute (HdyGridRequest *request,
+                    GtkOrientation  orientation,
+                    gint            for_size)
+{
+  HdyGridLine *lines = request->lines[orientation], *line;
+  gint splits = request->split.splits;
+  GtkRequestedSize *sizes[splits];
+  gint *wt_line;
+  gint *width_sum;
+  gint i_counter[splits];
+  gint line_count;
+  gint extra;
+
+  memset (i_counter, 0, sizeof (gint) * splits);
+  wt_line = request->split.wt_line;
+  width_sum = g_new0 (gint, splits);
+  line_count = request->max[orientation] - request->min[orientation];
+
+  for (gint i = 0; i < splits; i++)
+    sizes[i] = g_newa (GtkRequestedSize, request->split.line_mcount[i]);
+
+  for (gint i = 0, j, line_idx; i < line_count; i++) {
+    line_idx = wt_line[lines[i].weight];
+    j = i_counter[line_idx];
+    sizes[line_idx][j].minimum_size = lines[i].minimum;
+    sizes[line_idx][j].natural_size = lines[i].natural;
+    sizes[line_idx][j].data = &lines[i];
+    width_sum[line_idx] += lines[i].minimum;
+    i_counter[line_idx] = j + 1;
+  }
+
+  for (gint i = 0; i < splits; i++) {
+    gint expand_count = 0;
+    extra = gtk_distribute_natural_allocation (for_size - width_sum[i],
+                                               request->split.line_mcount[i],
+                                               sizes[i]);
+
+    for (gint j = 0; j < request->split.line_mcount[i]; j++) {
+      line = sizes[i][j].data;
+      if (line->expand)
+        expand_count++;
+    }
+
+    extra /= MAX (expand_count, 1);
+
+    for (gint j = 0; j < request->split.line_mcount[i]; j++) {
+      line = sizes[i][j].data;
+      line->allocation = sizes[i][j].minimum_size;
+      if (line->expand)
+        line->allocation += extra;
+    }
+  }
+
+  g_free (width_sum);
+}
+
+static void
+compute_size (HdyGrid        *self,
+              GtkOrientation  orientation,
+              gint           *min,
+              gint           *nat)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridRequest request;
+  HdyGridLine *lines, *line;
+  gint line_count;
+  gint *weights;
+
+  *min = 0;
+  *nat = 0;
+  count_lines (self, &request);
+
+  line_count = request.max[orientation] - request.min[orientation];
+  request.lines[orientation] = g_new0 (HdyGridLine, line_count);
+  lines = request.lines[orientation];
+
+  request_init (self, &request, orientation, 1);
+  request_run (self, &request, orientation, -1, 1);
+
+  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
+    weights = g_new0 (gint, request.weight[1] - request.weight[0]);
+
+    for (gint i = 0; i < line_count; i++) {
+      line = &lines[i];
+      weights[line->weight - request.weight[0]] += line->minimum;
+
+      *min = MAX (*min, weights[line->weight - request.weight[0]]);
+      *nat += line->natural;
+    }
+
+    *min += (line_count - 1) * priv->column_spacing;
+    *nat += (line_count - 1) * priv->column_spacing;
+
+    g_free (weights);
+  } else {
+    *min += (line_count - 1) * priv->row_spacing;
+    *nat += (line_count - 1) * priv->row_spacing;
+
+    for (gint i = 0; i < line_count; i++) {
+      *min += lines[i].minimum;
+      *nat += lines[i].natural;
+    }
+  }
+  g_free (lines);
+}
+
+static void
+compute_size_for_size (HdyGrid *self,
+                       gint     for_size,
+                       gint    *minimum_height,
+                       gint    *natural_height)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridRequest request;
+  HdyGridLine *lines;
+  GtkOrientation orientation = GTK_ORIENTATION_VERTICAL;
+  gint line_count;
+  gint splits;
+  gint min = 0;
+  gint nat = 0;
+
+  count_lines (self, &request);
+
+  line_count = request.max[1 - orientation] - request.min[1 - orientation];
+  request.lines[1 - orientation] = g_new0 (HdyGridLine, line_count);
+  request.split.wt_line = g_new0 (gint, request.weight[1] - request.weight[0]);
+  for_size -= (line_count - 1) * priv->column_spacing;
+
+  request_init (self, &request, 1 - orientation, 1);
+  request_run (self, &request, 1 - orientation, -1, 1);
+  column_split_count (&request, 1 - orientation, for_size);
+  request_distribute (&request, 1 - orientation, for_size);
+
+  splits = request.split.splits;
+  request.max[orientation] = request.max[orientation] * splits
+                             - (splits - 1) * request.min[orientation];
+  line_count = request.max[orientation] - request.min[orientation];
+  request.lines[orientation] = g_new0 (HdyGridLine, line_count);
+  lines = request.lines[orientation];
+  min += (line_count - 1) * priv->row_spacing;
+  nat += (line_count - 1) * priv->row_spacing;
+
+  request_init (self, &request, orientation, splits);
+  request_run (self, &request, orientation, for_size, splits);
+
+  for (gint i = 0; i < line_count; i++) {
+    min += lines[i].minimum;
+    nat += lines[i].natural;
+  }
+
+  if (minimum_height)
+    *minimum_height = min;
+  if (natural_height)
+    *natural_height = nat;
+
+  g_free (request.lines[0]);
+  g_free (request.lines[1]);
+  g_free (request.split.wt_line);
+  g_free (request.split.line_mcount);
+}
+
+/* This private method is prefixed by the call name because it will be a virtual
+ * method in GTK 4.
+ */
+static void
+hdy_grid_measure (GtkWidget      *widget,
+                  GtkOrientation  orientation,
+                  int             for_size,
+                  int            *minimum,
+                  int            *natural,
+                  int            *minimum_baseline,
+                  int            *natural_baseline)
+{
+  gint min = 0;
+  gint nat = 0;
+
+  if (for_size < 1) {
+    compute_size (HDY_GRID (widget), orientation, &min, &nat);
+  } else {
+    if (orientation == GTK_ORIENTATION_VERTICAL)
+      compute_size_for_size (HDY_GRID (widget), for_size, &min, &nat);
+  }
+
+  if (minimum)
+    *minimum = min;
+  if (natural)
+    *natural = nat;
+
+  if (minimum_baseline)
+    *natural_baseline = -1;
+  if (natural_baseline)
+    *minimum_baseline = -1;
+}
+
+static void
+hdy_grid_get_preferred_width (GtkWidget *widget,
+                              gint      *minimum_width,
+                              gint      *natural_width)
+{
+  hdy_grid_measure (widget, GTK_ORIENTATION_HORIZONTAL, -1,
+                    minimum_width, natural_width, NULL, NULL);
+}
+
+static void
+hdy_grid_get_preferred_height (GtkWidget *widget,
+                               gint      *minimum_height,
+                               gint      *natural_height)
+{
+  hdy_grid_measure (widget, GTK_ORIENTATION_VERTICAL, -1,
+                    minimum_height, natural_height, NULL, NULL);
+}
+
+static void
+hdy_grid_get_preferred_width_for_height (GtkWidget *widget,
+                                         gint       height,
+                                         gint      *minimum_width,
+                                         gint      *natural_width)
+{
+  hdy_grid_measure (widget, GTK_ORIENTATION_HORIZONTAL, -1,
+                    minimum_width, natural_width, NULL, NULL);
+}
+
+static void
+hdy_grid_get_preferred_height_for_width (GtkWidget *widget,
+                                         gint       width,
+                                         gint      *minimum_height,
+                                         gint      *natural_height)
+{
+  hdy_grid_measure (widget, GTK_ORIENTATION_VERTICAL, width,
+                    minimum_height, natural_height, NULL, NULL);
+}
+
+static void
+request_allocate (HdyGridRequest *request,
+                  GtkOrientation  orientation)
+{
+  HdyGridLine *lines, *line;
+  gint line_count;
+
+  lines = request->lines[orientation];
+  line_count = request->max[orientation] - request->min[orientation];
+
+  for (gint i = 0; i < line_count; i++) {
+    line = &lines[i];
+    line->allocation = line->minimum;
+  }
+}
+
+static void
+request_position (HdyGrid        *self,
+                  HdyGridRequest *request,
+                  GtkOrientation  orientation)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridLine *lines, *line;
+  gint *position;
+  gint *wt_line;
+  gint splits;
+  gint line_count;
+  gint line_idx = 0;
+  gint spacing;
+
+  wt_line = request->split.wt_line;
+  splits = request->split.splits;
+  lines = request->lines[orientation];
+  line_count = request->max[orientation] - request->min[orientation];
+
+  if (orientation == GTK_ORIENTATION_HORIZONTAL) {
+    position = g_new0 (gint, splits);
+    spacing = priv->column_spacing;
+  } else {
+    position = g_new0 (gint, 1);
+    spacing = priv->row_spacing;
+  }
+
+  for (gint i = 0; i < line_count; i++) {
+    line = &lines[i];
+
+    if (orientation == GTK_ORIENTATION_HORIZONTAL && splits > 1)
+      line_idx = wt_line[line->weight];
+
+    line->position = position[line_idx];
+    position[line_idx] += line->allocation + spacing;
+  }
+
+  g_free (position);
+}
+
+static void
+request_allocate_child (HdyGridRequest *request,
+                        HdyGridChild   *child,
+                        GtkOrientation  orientation,
+                        gint           *position,
+                        gint           *size)
+{
+  HdyGridLine *lines = request->lines[orientation];
+  gint splits = request->split.splits;
+  gint *wt_line = request->split.wt_line;
+  gint min_line = request->min[orientation];
+  gint weight = request->lines[0][child->attach[0] - request->min[0]].weight;
+  gint line_idx;
+
+  if (orientation == GTK_ORIENTATION_VERTICAL && splits > 1)
+    line_idx = (child->attach[orientation] - min_line) * splits + wt_line[weight];
+  else
+    line_idx = child->attach[orientation] - min_line;
+
+  *position = lines[line_idx].position;
+  *size = lines[line_idx].allocation;
+}
+
+static void
+request_allocate_children (HdyGrid        *self,
+                           HdyGridRequest *request,
+                           GtkAllocation  *allocation)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridChild *child;
+  GtkAllocation child_allocation;
+  GList *list = priv->children;
+  gint height, width;
+  gint x, y;
+
+  for (; list; list = list->next) {
+    child = list->data;
+
+    request_allocate_child (request, child, GTK_ORIENTATION_HORIZONTAL, &x, &width);
+    request_allocate_child (request, child, GTK_ORIENTATION_VERTICAL, &y, &height);
+
+    child_allocation.x = allocation->x + x;
+    child_allocation.y = allocation->y + y;
+    child_allocation.height = height;
+    child_allocation.width = width;
+
+    gtk_widget_size_allocate_with_baseline (child->widget, &child_allocation, -1);
+  }
+}
+
+static void
+hdy_grid_size_allocate (GtkWidget     *widget,
+                        GtkAllocation *allocation)
+{
+  HdyGrid *self = HDY_GRID (widget);
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  HdyGridRequest request;
+  GtkOrientation orientation = GTK_ORIENTATION_VERTICAL;
+  gint line_count;
+  gint splits;
+  gint for_size;
+
+  count_lines (self, &request);
+
+  line_count = request.max[1 - orientation] - request.min[1 - orientation];
+  request.lines[1 - orientation] = g_new0 (HdyGridLine, line_count);
+  request.split.wt_line = g_new0 (gint, request.weight[1] - request.weight[0]);
+  for_size = allocation->width - (line_count - 1) * priv->column_spacing;
+
+  request_init (self, &request, 1 - orientation, 1);
+  request_run (self, &request, 1 - orientation, -1, 1);
+  column_split_count (&request, 1 - orientation, for_size);
+  request_distribute (&request, 1 - orientation, for_size);
+
+  splits = request.split.splits;
+  request.max[orientation] = request.max[orientation] * splits
+                             - (splits - 1) * request.min[orientation];
+  line_count = request.max[orientation] - request.min[orientation];
+  request.lines[orientation] = g_new0 (HdyGridLine, line_count);
+
+  request_init (self, &request, orientation, splits);
+  request_run (self, &request, orientation, allocation->width, splits);
+  request_allocate (&request, orientation);
+
+  request_position (self, &request, 0);
+  request_position (self, &request, 1);
+  request_allocate_children (self, &request, allocation);
+
+  GTK_WIDGET_CLASS (hdy_grid_parent_class)->size_allocate (widget, allocation);
+  gtk_widget_set_clip (widget, allocation);
+
+  g_free (request.lines[0]);
+  g_free (request.lines[1]);
+  g_free (request.split.wt_line);
+  g_free (request.split.line_mcount);
+}
+
+static void
+hdy_grid_forall (GtkContainer *container,
+                 gboolean      include_internals,
+                 GtkCallback   callback,
+                 gpointer      callback_data)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (HDY_GRID (container));
+  HdyGridChild *child;
+  GList *l;
+
+  for (l = priv->children; l; l = l->next) {
+    child = l->data;
+    (* callback) (child->widget, callback_data);
+  }
+}
+
+static void
+hdy_grid_add (GtkContainer *container,
+              GtkWidget    *widget)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (HDY_GRID (container));
+  HdyGridChild *child;
+
+  child = g_slice_new (HdyGridChild);
+  child->widget = widget;
+
+  priv->children = g_list_prepend (priv->children, child);
+
+  gtk_widget_set_parent (widget, GTK_WIDGET (container));
+}
+
+static void
+hdy_grid_remove (GtkContainer *self,
+                 GtkWidget    *child)
+{
+  HdyGridPrivate *priv;
+  GList *l;
+
+  HDY_IS_GRID (self);
+  GTK_IS_WIDGET (child);
+
+  priv = hdy_grid_get_instance_private (HDY_GRID (self));
+  l = find_child (priv->children, child);
+
+  if (!l)
+    return;
+
+  priv->children = g_list_delete_link (priv->children, l);
+}
+
+static void
+hdy_grid_get_property (GObject    *object,
+                       guint       property_id,
+                       GValue     *value,
+                       GParamSpec *pspec)
+{
+  switch (property_id) {
+  case PROP_ROW_SPACING:
+    g_value_set_int (value, hdy_grid_get_row_spacing (HDY_GRID (object)));
+    break;
+  case PROP_COLUMN_SPACING:
+    g_value_set_int (value, hdy_grid_get_column_spacing (HDY_GRID (object)));
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+    break;
+  }
+}
+
+static void
+hdy_grid_set_property (GObject      *object,
+                       guint         property_id,
+                       const GValue *value,
+                       GParamSpec   *pspec)
+{
+  switch (property_id) {
+  case PROP_ROW_SPACING:
+    hdy_grid_set_row_spacing (HDY_GRID (object), g_value_get_int (value));
+    break;
+  case PROP_COLUMN_SPACING:
+    hdy_grid_set_column_spacing (HDY_GRID (object), g_value_get_int (value));
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+    break;
+  }
+}
+
+static void
+hdy_grid_finalize (GObject *object)
+{
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (HDY_GRID (object));
+
+  g_list_free_full (priv->children, (GDestroyNotify) free_child);
+  g_list_free_full (priv->columns_prop, (GDestroyNotify) free_columns_prop);
+
+  G_OBJECT_CLASS (hdy_grid_parent_class)->finalize (object);
+}
+
+static void
+hdy_grid_get_child_property (GtkContainer *object,
+                             GtkWidget    *child,
+                             guint         prop_id,
+                             GValue       *value,
+                             GParamSpec   *pspec)
+{
+  switch (prop_id) {
+  case CHILD_PROP_COLUMN:
+    g_value_set_int (value, hdy_grid_get_child_column (HDY_GRID (object), child));
+    break;
+  case CHILD_PROP_ROW:
+    g_value_set_int (value, hdy_grid_get_child_row (HDY_GRID (object), child));
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+hdy_grid_set_child_property (GtkContainer *object,
+                             GtkWidget    *child,
+                             guint         prop_id,
+                             const GValue *value,
+                             GParamSpec   *pspec)
+{
+  switch (prop_id) {
+  case CHILD_PROP_COLUMN:
+    hdy_grid_set_child_column (HDY_GRID (object), child, g_value_get_int (value));
+    break;
+  case CHILD_PROP_ROW:
+    hdy_grid_set_child_row (HDY_GRID (object), child, g_value_get_int (value));
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
+hdy_grid_class_init (HdyGridClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+  GtkWidgetClass *widget_class = (GtkWidgetClass*) klass;
+  GtkContainerClass *container_class = (GtkContainerClass*) klass;
+
+  object_class->get_property = hdy_grid_get_property;
+  object_class->set_property = hdy_grid_set_property;
+  object_class->finalize = hdy_grid_finalize;
+
+  widget_class->get_preferred_width = hdy_grid_get_preferred_width;
+  widget_class->get_preferred_height = hdy_grid_get_preferred_height;
+  widget_class->get_preferred_width_for_height = hdy_grid_get_preferred_width_for_height;
+  widget_class->get_preferred_height_for_width = hdy_grid_get_preferred_height_for_width;
+  widget_class->size_allocate = hdy_grid_size_allocate;
+
+  container_class->add = hdy_grid_add;
+  container_class->remove = hdy_grid_remove;
+  container_class->forall = hdy_grid_forall;
+  container_class->set_child_property = hdy_grid_set_child_property;
+  container_class->get_child_property = hdy_grid_get_child_property;
+
+  props[PROP_ROW_SPACING] =
+        g_param_spec_int ("row-spacing",
+                          _("Row spacing"),
+                          _("Space between two adjacent rows."),
+                          0,
+                          G_MAXINT,
+                          0,
+                          G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY);
+
+  props[PROP_COLUMN_SPACING] =
+        g_param_spec_int ("column-spacing",
+                          _("Column spacing"),
+                          _("Space between two adjacent columns."),
+                          0,
+                          G_MAXINT,
+                          0,
+                          G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY);
+
+  child_props[CHILD_PROP_COLUMN] =
+        g_param_spec_int ("column",
+                          _("Column"),
+                          _("Column position of the widget in a row."),
+                          1,
+                          G_MAXINT,
+                          1,
+                          G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY);
+
+  child_props[CHILD_PROP_ROW] =
+        g_param_spec_int ("row",
+                          _("Row"),
+                          _("Row position of the widget in a column."),
+                          1,
+                          G_MAXINT,
+                          1,
+                          G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY);
+
+  g_object_class_install_properties (object_class, LAST_PROP, props);
+  gtk_container_class_install_child_properties (container_class, LAST_CHILD_PROP, child_props);
+  gtk_widget_class_set_css_name (widget_class, "grid");
+}
+
+/*< private >
+ * @builder: a #GtkBuilder
+ * @context: the #GMarkupParseContext
+ * @parent_name: the name of the expected parent element
+ * @error: return location for an error
+ *
+ * Checks that the parent element of the currently handled
+ * start tag is @parent_name and set @error if it isn't.
+ *
+ * This is intended to be called in start_element vfuncs to
+ * ensure that element nesting is as intended.
+ *
+ * Returns: %TRUE if @parent_name is the parent element
+ */
+/* This has been copied and modified from gtkbuilder.c. */
+static gboolean
+_gtk_builder_check_parent (GtkBuilder           *builder,
+                           GMarkupParseContext  *context,
+                           const gchar          *parent_name,
+                           GError              **error)
+{
+  const GSList *stack;
+  gint line, col;
+  const gchar *parent;
+  const gchar *element;
+
+  stack = g_markup_parse_context_get_element_stack (context);
+
+  element = (const gchar *)stack->data;
+  parent = stack->next ? (const gchar *)stack->next->data : "";
+
+  if (g_str_equal (parent_name, parent) ||
+      (g_str_equal (parent_name, "object") && g_str_equal (parent, "template")))
+    return TRUE;
+
+  g_markup_parse_context_get_position (context, &line, &col);
+  g_set_error (error,
+               GTK_BUILDER_ERROR,
+               GTK_BUILDER_ERROR_INVALID_TAG,
+               ".:%d:%d Can't use <%s> here",
+               line, col, element);
+
+  return FALSE;
+}
+
+/*< private >
+ * _gtk_builder_prefix_error:
+ * @builder: a #GtkBuilder
+ * @context: the #GMarkupParseContext
+ * @error: an error
+ *
+ * Calls g_prefix_error() to prepend a filename:line:column marker
+ * to the given error. The filename is taken from @builder, and
+ * the line and column are obtained by calling
+ * g_markup_parse_context_get_position().
+ *
+ * This is intended to be called on errors returned by
+ * g_markup_collect_attributes() in a start_element vfunc.
+ */
+/* This has been copied and modified from gtkbuilder.c. */
+static void
+_gtk_builder_prefix_error (GtkBuilder           *builder,
+                           GMarkupParseContext  *context,
+                           GError              **error)
+{
+  gint line, col;
+
+  g_markup_parse_context_get_position (context, &line, &col);
+  g_prefix_error (error, ".:%d:%d ", line, col);
+}
+
+/*< private >
+ * _gtk_builder_error_unhandled_tag:
+ * @builder: a #GtkBuilder
+ * @context: the #GMarkupParseContext
+ * @object: name of the object that is being handled
+ * @element_name: name of the element whose start tag is being handled
+ * @error: return location for the error
+ *
+ * Sets @error to a suitable error indicating that an @element_name
+ * tag is not expected in the custom markup for @object.
+ *
+ * This is intended to be called in a start_element vfunc.
+ */
+/* This has been copied and modified from gtkbuilder.c. */
+static void
+_gtk_builder_error_unhandled_tag (GtkBuilder           *builder,
+                                  GMarkupParseContext  *context,
+                                  const gchar          *object,
+                                  const gchar          *element_name,
+                                  GError              **error)
+{
+  gint line, col;
+
+  g_markup_parse_context_get_position (context, &line, &col);
+  g_set_error (error,
+               GTK_BUILDER_ERROR,
+               GTK_BUILDER_ERROR_UNHANDLED_TAG,
+               ".:%d:%d Unsupported tag for %s: <%s>",
+               line, col,
+               object, element_name);
+}
+
+static void
+hdy_grid_buildable_add_column_property (HdyGrid     *self,
+                                        GtkBuilder  *builder,
+                                        const gchar *position,
+                                        const gchar *weight)
+{
+  HdyGridColumnProperty *prop = g_slice_new (HdyGridColumnProperty);
+  HdyGridPrivate *priv = hdy_grid_get_instance_private (self);
+  GValue gvalue = G_VALUE_INIT;
+  GError *error = NULL;
+
+  if (!gtk_builder_value_from_string_type (builder, G_TYPE_INT, position, &gvalue, &error)) {
+    g_warning ("Could not read property %s:position with value %s: %s",
+               g_type_name (G_OBJECT_TYPE (self)),
+               position,
+               error->message);
+    g_error_free (error);
+    return;
+  }
+
+  prop->column = g_value_get_int (&gvalue);
+  g_value_unset (&gvalue);
+
+  if (!gtk_builder_value_from_string_type (builder, G_TYPE_INT, weight, &gvalue, &error)) {
+    g_warning ("Could not read property %s:weight with value %s: %s",
+               g_type_name (G_OBJECT_TYPE (self)),
+               weight,
+               error->message);
+    g_error_free (error);
+    return;
+  }
+
+  prop->weight = g_value_get_int (&gvalue);
+  g_value_unset (&gvalue);
+
+  if (prop->weight < 0) {
+    g_warning ("Invalid value: %d to column weight", prop->weight);
+    return;
+  } else if (prop->column < 1) {
+    g_warning ("Column %d is out of range in the grid", prop->column);
+    return;
+  }
+
+  priv->columns_prop = g_list_prepend (priv->columns_prop, prop);
+}
+
+typedef struct {
+  HdyGrid *grid;
+  GtkBuilder *builder;
+  gchar *text;
+  gchar *position;
+  gchar *weight;
+} HdyGridColumnsData;
+
+static void
+columns_start_element (GMarkupParseContext  *context,
+                       const gchar          *element_name,
+                       const gchar         **names,
+                       const gchar         **values,
+                       gpointer              user_data,
+                       GError              **error)
+{
+  HdyGridColumnsData *data = (HdyGridColumnsData *) user_data;
+  const gchar *val;
+
+  if (strcmp (element_name, "columns") == 0) {
+    if (!_gtk_builder_check_parent (data->builder, context, "object", error))
+      return;
+  } else if (strcmp (element_name, "column") == 0) {
+    if (!_gtk_builder_check_parent (data->builder, context, "columns", error))
+      return;
+  } else if (strcmp (element_name, "property") == 0) {
+    if (!_gtk_builder_check_parent (data->builder, context, "column", error))
+      return;
+
+    if (!g_markup_collect_attributes (element_name, names, values, error,
+                                      G_MARKUP_COLLECT_STRING, "name", &val,
+                                      G_MARKUP_COLLECT_INVALID))
+      _gtk_builder_prefix_error (data->builder, context, error);
+
+    data->text = g_strdup (val);
+  } else {
+    _gtk_builder_error_unhandled_tag (data->builder, context,
+                                      "HdyGrid", element_name,
+                                      error);
+  }
+}
+
+static void
+columns_text_element (GMarkupParseContext  *context,
+                      const gchar          *text,
+                      gsize                 text_len,
+                      gpointer              user_data,
+                      GError              **error)
+{
+  HdyGridColumnsData *data = (HdyGridColumnsData *) user_data;
+
+  if (data->text) {
+    if (strcmp (data->text, "weight") == 0)
+      data->weight = g_strndup (text, text_len);
+    else if (strcmp (data->text, "position") == 0)
+      data->position = g_strndup (text, text_len);
+  }
+}
+
+static void
+columns_end_element (GMarkupParseContext  *context,
+                     const gchar          *element_name,
+                     gpointer              user_data,
+                     GError              **error)
+{
+  HdyGridColumnsData *data = (HdyGridColumnsData *) user_data;
+
+  if (strcmp (element_name, "column") == 0) {
+    if (data->position && data->weight)
+      hdy_grid_buildable_add_column_property (data->grid, data->builder,
+                                              data->position, data->weight);
+
+    g_clear_pointer (&data->text, g_free);
+    g_clear_pointer (&data->weight, g_free);
+    g_clear_pointer (&data->position, g_free);
+  } else if (strcmp (element_name, "property") == 0) {
+    g_clear_pointer (&data->text, g_free);
+  }
+}
+
+static const GMarkupParser columns_parser =
+  {
+    columns_start_element,
+    columns_end_element,
+    columns_text_element
+  };
+
+static gboolean
+hdy_grid_buildable_custom_tag_start (GtkBuildable  *buildable,
+                                     GtkBuilder    *builder,
+                                     GObject       *child,
+                                     const gchar   *tagname,
+                                     GMarkupParser *parser,
+                                     gpointer      *parser_data)
+{
+  if (parent_buildable_iface->custom_tag_start (buildable, builder, child,
+                                                tagname, parser, parser_data))
+    return TRUE;
+
+  if (child)
+    return FALSE;
+
+  if (strcmp (tagname, "columns") == 0) {
+    HdyGridColumnsData *data = g_slice_new0 (HdyGridColumnsData);
+
+    data->builder = builder;
+    data->grid = HDY_GRID (buildable);
+    data->text = NULL;
+    data->position = NULL;
+    data->weight = NULL;
+
+    *parser = columns_parser;
+    *parser_data = data;
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+static void
+hdy_grid_buildable_custom_tag_end (GtkBuildable *buildable,
+                                   GtkBuilder   *builder,
+                                   GObject      *child,
+                                   const gchar  *tagname,
+                                   gpointer     *parser_data)
+{
+  if (strcmp (tagname, "columns") == 0) {
+    HdyGridColumnsData *data = (HdyGridColumnsData *) parser_data;
+
+    g_slice_free (HdyGridColumnsData, data);
+
+    return;
+  }
+
+  if (parent_buildable_iface->custom_tag_end)
+    parent_buildable_iface->custom_tag_end (buildable, builder,
+                                            child, tagname, parser_data);
+}
+
+static void
+hdy_grid_buildable_init (GtkBuildableIface *iface)
+{
+  parent_buildable_iface = g_type_interface_peek_parent (iface);
+  iface->custom_tag_start = hdy_grid_buildable_custom_tag_start;
+  iface->custom_tag_end = hdy_grid_buildable_custom_tag_end;
+}
+
+static void
+hdy_grid_init (HdyGrid *self)
+{
+  gtk_widget_set_has_window (GTK_WIDGET (self), FALSE);
+}
+
+GtkWidget *
+hdy_grid_new (void)
+{
+  return g_object_new (HDY_TYPE_GRID, NULL);
+}
+
+/**
+ * hdy_grid_get_column_spacing:
+ * @self: a #HdyGrid
+ *
+ * Sets the position for the child.
+ * See hdy_grid_set_column_spacing().
+ *
+ * Returns: the current spacing between adjacent columns.
+ *
+ * Since: 1.0
+ */
+gint
+hdy_grid_get_column_spacing (HdyGrid *self)
+{
+  HdyGridPrivate *priv;
+
+  HDY_IS_GRID (self);
+
+  priv = hdy_grid_get_instance_private (self);
+  return priv->column_spacing;
+}
+
+/**
+ * hdy_grid_set_column_spacing:
+ * @self: a #HdyGrid
+ * @spacing: desired spacing between adjacent columns
+ *
+ * Sets the position for the child.
+ * See hdy_grid_get_column_spacing().
+ *
+ * Since: 1.0
+ */
+void
+hdy_grid_set_column_spacing (HdyGrid *self,
+                             gint     spacing)
+{
+  HdyGridPrivate *priv;
+
+  HDY_IS_GRID (self);
+
+  priv = hdy_grid_get_instance_private (self);
+  priv->column_spacing = spacing;
+
+  g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COLUMN_SPACING]);
+}
+
+/**
+ * hdy_grid_get_row_spacing:
+ * @self: a #HdyGrid
+ *
+ * Sets the position for the child.
+ * See hdy_grid_set_row_spacing().
+ *
+ * Returns: the current spacing between adjacent rows.
+ *
+ * Since: 1.0
+ */
+gint
+hdy_grid_get_row_spacing (HdyGrid *self)
+{
+  HdyGridPrivate *priv;
+
+  HDY_IS_GRID (self);
+
+  priv = hdy_grid_get_instance_private (self);
+  return priv->row_spacing;
+}
+
+/**
+ * hdy_grid_set_row_spacing:
+ * @self: a #HdyGrid
+ * @spacing: desired spacing between adjacent rows
+ *
+ * Sets the position for the child.
+ * See hdy_grid_get_row_spacing().
+ *
+ * Since: 1.0
+ */
+void
+hdy_grid_set_row_spacing (HdyGrid *self,
+                          gint     spacing)
+{
+  HdyGridPrivate *priv;
+
+  HDY_IS_GRID (self);
+
+  priv = hdy_grid_get_instance_private (self);
+  priv->row_spacing = spacing;
+
+  g_object_notify_by_pspec (G_OBJECT (self), props[PROP_ROW_SPACING]);
+}
+
+/**
+ * hdy_grid_get_child_column:
+ * @self: a #HdyGrid
+ * @child: a child
+ *
+ * Gets the position of child.
+ * See hdy_grid_set_child_column().
+ *
+ * Returns: the position of child, -1 if child is not found.
+ *
+ * Since: 1.0
+ */
+gint
+hdy_grid_get_child_column (HdyGrid   *self,
+                           GtkWidget *child)
+{
+  HdyGridPrivate *priv;
+  GList *l;
+  HdyGridChild *child_ref;
+
+  HDY_IS_GRID (self);
+  g_return_val_if_fail (GTK_IS_WIDGET (child), -1);
+
+  priv = hdy_grid_get_instance_private (self);
+  l = find_child (priv->children, child);
+
+  if (l) {
+    child_ref = l->data;
+    return child_ref->attach[0];
+  } else {
+    return -1;
+  }
+}
+
+/**
+ * hdy_grid_set_child_column:
+ * @self: a #HdyGrid
+ * @child: a child
+ * @column: the new position for child
+ *
+ * Sets the position for the child.
+ * See hdy_grid_get_child_column().
+ *
+ * Since: 1.0
+ */
+void
+hdy_grid_set_child_column (HdyGrid   *self,
+                           GtkWidget *child,
+                           gint       column)
+{
+  HdyGridPrivate *priv;
+  HdyGridChild *child_ref;
+  GList *l;
+
+  HDY_IS_GRID (self);
+  GTK_IS_WIDGET (child);
+
+  priv = hdy_grid_get_instance_private (self);
+  l = find_child (priv->children, child);
+
+  if (l) {
+    child_ref = l->data;
+    child_ref->attach[0] = column;
+    g_object_notify_by_pspec (G_OBJECT (child), child_props[CHILD_PROP_COLUMN]);
+  }
+}
+
+/**
+ * hdy_grid_get_child_row:
+ * @self: a #HdyGrid
+ * @child: a child
+ *
+ * Gets the position of child.
+ * See hdy_grid_set_child_row().
+ *
+ * Returns: the top attach of child, -1 if child is not found.
+ *
+ * Since: 1.0
+ */
+gint
+hdy_grid_get_child_row (HdyGrid   *self,
+                        GtkWidget *child)
+{
+  HdyGridPrivate *priv;
+  GList *l;
+  HdyGridChild *child_info;
+
+  HDY_IS_GRID (self);
+  g_return_val_if_fail (GTK_IS_WIDGET (child), -1);
+
+  priv = hdy_grid_get_instance_private (self);
+  l = find_child (priv->children, child);
+
+  if (l) {
+    child_info = l->data;
+    return child_info->attach[1];
+  } else {
+    return -1;
+  }
+}
+
+/**
+ * hdy_grid_set_child_row:
+ * @self: a #HdyGrid
+ * @child: a child
+ * @row: the new position for child
+ *
+ * Sets the position for the child.
+ * See hdy_grid_get_child_row().
+ *
+ * Since: 1.0
+ */
+void
+hdy_grid_set_child_row (HdyGrid   *self,
+                        GtkWidget *child,
+                        gint       row)
+{
+  HdyGridPrivate *priv;
+  HdyGridChild *child_ref;
+  GList *l;
+
+  HDY_IS_GRID (self);
+  GTK_IS_WIDGET (child);
+
+  priv = hdy_grid_get_instance_private (self);
+  l = find_child (priv->children, child);
+
+  if (l) {
+    child_ref = l->data;
+    child_ref->attach[1] = row;
+    g_object_notify_by_pspec (G_OBJECT (child), child_props[CHILD_PROP_COLUMN]);
+  }
+}
+
 # Logs
 logs
 *.log
